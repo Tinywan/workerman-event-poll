@@ -30,7 +30,7 @@ composer require tinywan/workerman-event-poll
 
 ```php
 use Workerman\Worker;
-use Tinywan\WorkermanEventPoll\Poll;
+use Workerman\Events\Poll;
 
 Worker::$eventLoopClass = Poll::class;
 

@@ -7,7 +7,7 @@
 
 require __DIR__ . '/../vendor/autoload.php';
 
-use Tinywan\WorkermanEventPoll\Poll;
+use Workerman\Events\Poll;
 
 $loop = new Poll();
 

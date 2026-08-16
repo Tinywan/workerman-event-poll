@@ -2,13 +2,12 @@
 
 declare(strict_types=1);
 
-namespace Tinywan\WorkermanEventPoll;
+namespace Workerman\Events;
 
 use Io\Poll\Context;
 use Io\Poll\Event;
 use Io\Poll\FailedPollWaitException;
 use Io\Poll\Watcher;
-use Workerman\Events\EventInterface;
 
 /**
  * Workerman 5.x event loop driver based on the Io\Poll API.
@@ -18,7 +17,7 @@ use Workerman\Events\EventInterface;
  * On PHP 8.1+ it works through symfony/polyfill-io-poll.
  *
  * Usage:
- *     Worker::$eventLoopClass = \Tinywan\WorkermanEventPoll\Poll::class;
+ *     Worker::$eventLoopClass = \Workerman\Events\Poll::class;
  */
 final class Poll implements EventInterface
 {

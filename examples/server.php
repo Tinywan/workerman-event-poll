@@ -12,9 +12,9 @@ require __DIR__ . '/../vendor/autoload.php';
 use Workerman\Connection\TcpConnection;
 use Workerman\Protocols\Http\Request;
 use Workerman\Protocols\Http\Response;
+use Workerman\Events\Poll;
 use Workerman\Timer;
 use Workerman\Worker;
-use Tinywan\WorkermanEventPoll\Poll;
 
 Worker::$eventLoopClass = Poll::class;
 
@@ -30,7 +30,7 @@ $http = new Worker('http://0.0.0.0:8080');
 $http->name = 'poll-http';
 $http->onMessage = function (TcpConnection $connection, Request $request) {
     $connection->send(new Response(200, ['Content-Type' => 'application/json'], json_encode([
-        'driver' => 'Tinywan\\WorkermanEventPoll\\Poll',
+        'driver' => 'Workerman\\Events\\Poll',
         'php' => PHP_VERSION,
         'method' => $request->method(),
         'path' => $request->path(),
