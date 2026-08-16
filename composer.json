@@ -1,0 +1,35 @@
+{
+    "name": "tinywan/workerman-event-poll",
+    "description": "Workerman 5.x event loop driver based on the PHP 8.6 Io\\Poll API, with symfony polyfill support for PHP 8.1+",
+    "type": "library",
+    "license": "MIT",
+    "keywords": [
+        "workerman",
+        "event-loop",
+        "io-poll",
+        "epoll",
+        "kqueue",
+        "async"
+    ],
+    "authors": [
+        {
+            "name": "Tinywan",
+            "email": "756684177@qq.com"
+        }
+    ],
+    "require": {
+        "php": ">=8.1",
+        "workerman/workerman": "^5.0",
+        "symfony/polyfill-io-poll": "^1.41"
+    },
+    "suggest": {
+        "symfony/polyfill-time": "Only needed if you pin symfony/polyfill-io-poll to 1.x-dev on PHP < 8.6 (provides Time\\Duration)",
+        "ext-pcntl": "Required by Workerman on POSIX systems",
+        "ext-posix": "Required by Workerman on POSIX systems"
+    },
+    "autoload": {
+        "psr-4": {
+            "Tinywan\\WorkermanEventPoll\\": "src/"
+        }
+    }
+}
