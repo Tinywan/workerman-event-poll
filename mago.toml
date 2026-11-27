@@ -1,0 +1,14 @@
+php-version = "8.6.0"
+
+[source]
+paths = ["src", "tests"]
+includes = ["vendor", "stubs"]
+excludes = []
+
+[linter.rules]
+too-many-methods = { enabled = false }
+kan-defect = { enabled = false }
+cyclomatic-complexity = { enabled = false }
+halstead = { enabled = false }
+no-isset = { enabled = false }
+literal-named-argument = { enabled = false }

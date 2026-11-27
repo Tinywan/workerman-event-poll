@@ -4,360 +4,552 @@ declare(strict_types=1);
 
 namespace Workerman\Events;
 
+use Io\Poll\Backend;
 use Io\Poll\Context;
 use Io\Poll\Event;
+use Io\Poll\FailedPollOperationException;
 use Io\Poll\FailedPollWaitException;
 use Io\Poll\Watcher;
+use RuntimeException;
+use SplPriorityQueue;
+use StreamPollHandle;
+use Throwable;
+use Time\Duration;
+use Workerman\Worker;
+
+use function array_keys;
+use function ceil;
+use function class_exists;
+use function count;
+use function function_exists;
+use function in_array;
+use function is_int;
+use function is_resource;
+use function method_exists;
+use function microtime;
+use function pcntl_signal;
+use function pcntl_signal_dispatch;
+use function str_contains;
+use function strtolower;
+
+use const DIRECTORY_SEPARATOR;
+use const PHP_VERSION_ID;
+use const SIG_IGN;
 
 /**
- * Workerman 5.x event loop driver based on the Io\Poll API.
+ * 基于 PHP 8.6+ 原生 Io\Poll 的 Workerman 5 事件循环驱动
  *
- * On PHP 8.6+ it uses the native engine-level implementation
- * (epoll on Linux, kqueue on macOS/BSD, WSAPoll on Windows).
- * On PHP 8.1+ it works through symfony/polyfill-io-poll.
- *
- * Usage:
- *     Worker::$eventLoopClass = \Workerman\Events\Poll::class;
+ * 特点：
+ *  1. 零第三方扩展依赖：直接使用 PHP 8.6 内置 Io\Poll（Linux 自动选用 Epoll，macOS 自动选用 Kqueue），
+ *     彻底突破 stream_select 的 1024 FD 上限；
+ *  2. 完整实现 Workerman 5 的 EventInterface（I/O、延迟/周期定时器、POSIX 信号、错误处理）；
+ *  3. 同一 stream 仅维护一个 Watcher，读写事件变更时通过 Watcher::modifyEvents() 原地更新；
+ *  4. 信号注册时关闭 restart_syscalls（false），保证阻塞中的 Context::wait() 能被信号及时打断。
  */
 final class Poll implements EventInterface
 {
-    /**
-     * @var array<int, Watcher>
-     */
-    private array $watchers = [];
+    private bool $running = true;
+
+    private ?Context $context = null;
+
+    private Backend $backend;
 
     /**
-     * @var array<int, array{read: ?callable, write: ?callable}>
-     */
-    private array $callbacks = [];
-
-    /**
-     * Timer id => [runAt, interval, func, args].
+     * 定时器最小堆（priority 为运行时间戳的相反数，data 为 [timerId, runTime]）
      *
-     * @var array<int, array{float, float, callable, array}>
+     * @var SplPriorityQueue<float, array{0: int, 1: float}>
      */
-    private array $timers = [];
-
-    private static int $timerId = 1;
+    private SplPriorityQueue $scheduler;
 
     /**
+     * stream 事件表：fdKey => [fd, read, write, handle, watcher]
+     *
+     * @var array<int, array{
+     *     fd: resource,
+     *     read: ?callable,
+     *     write: ?callable,
+     *     handle: ?StreamPollHandle,
+     *     watcher: ?Watcher
+     * }>
+     */
+    private array $events = [];
+
+    /**
+     * 信号事件表：signal => callable
+     *
      * @var array<int, callable>
      */
-    private array $signals = [];
+    private array $signalEvents = [];
 
     /**
-     * @var ?callable
+     * 定时器事件表：timerId => [func, args, interval|null]
+     *
+     * @var array<int, array{0: callable, 1: array, 2: ?float}>
+     */
+    private array $eventTimer = [];
+
+    private int $timerId = 1;
+
+    private int $streamWatcherCount = 0;
+
+    /**
+     * @var ?callable(Throwable): void
      */
     private $errorHandler = null;
 
-    private bool $running = false;
+    /**
+     * 当前 PHP 环境是否支持原生 Io\Poll 事件循环
+     */
+    public static function isSupported(): bool
+    {
+        return (
+            PHP_VERSION_ID >= 80_600
+            && class_exists(Context::class)
+            && class_exists(StreamPollHandle::class)
+            && method_exists(Context::class, 'wait')
+        );
+    }
 
-    private ?bool $waitUsesDuration = null;
-
-    public function __construct(
-        private readonly Context $poll = new Context(),
-    ) {
-        if (DIRECTORY_SEPARATOR === '/' && extension_loaded('pcntl')) {
-            pcntl_async_signals(true);
+    public function __construct(Backend $backend = Backend::Auto)
+    {
+        if (!self::isSupported()) {
+            throw new RuntimeException('Workerman\\Events\\Poll requires PHP 8.6+ with native Io\\Poll support.');
         }
+
+        $this->context = new Context($backend);
+        $this->backend = $this->context->getBackend();
+        $this->scheduler = new SplPriorityQueue();
     }
 
     /**
-     * {@inheritdoc}
+     * 返回底层实际使用的 I/O 多路复用后端名称（如 Epoll / Kqueue / Poll）
      */
+    public function getBackendName(): string
+    {
+        return $this->backend->name;
+    }
+
     public function delay(float $delay, callable $func, array $args = []): int
     {
-        $timerId = self::$timerId++;
-        $this->timers[$timerId] = [microtime(true) + $delay, 0, $func, $args];
+        $delay = $delay > 0 ? $delay : 0.0;
+        $timerId = $this->timerId++;
+        $runTime = microtime(true) + $delay;
+        $this->scheduler->insert([$timerId, $runTime], -$runTime);
+        $this->eventTimer[$timerId] = [$func, $args, null];
         return $timerId;
     }
 
-    /**
-     * {@inheritdoc}
-     */
     public function offDelay(int $timerId): bool
     {
-        if (isset($this->timers[$timerId])) {
-            unset($this->timers[$timerId]);
+        if (isset($this->eventTimer[$timerId])) {
+            unset($this->eventTimer[$timerId]);
             return true;
         }
         return false;
     }
 
-    /**
-     * {@inheritdoc}
-     */
     public function repeat(float $interval, callable $func, array $args = []): int
     {
-        $timerId = self::$timerId++;
-        $this->timers[$timerId] = [microtime(true) + $interval, $interval, $func, $args];
+        if ($interval <= 0) {
+            return 0;
+        }
+        $timerId = $this->timerId++;
+        $runTime = microtime(true) + $interval;
+        $this->scheduler->insert([$timerId, $runTime], -$runTime);
+        $this->eventTimer[$timerId] = [$func, $args, $interval];
         return $timerId;
     }
 
-    /**
-     * {@inheritdoc}
-     */
     public function offRepeat(int $timerId): bool
     {
         return $this->offDelay($timerId);
     }
 
-    /**
-     * {@inheritdoc}
-     */
     public function onReadable($stream, callable $func): void
     {
-        $fdKey = (int)$stream;
-        $this->callbacks[$fdKey]['read'] = $func;
-        $this->callbacks[$fdKey]['write'] ??= null;
-        $this->updateWatcher($fdKey, $stream);
+        $this->addStreamEvent($stream, 'read', $func);
     }
 
-    /**
-     * {@inheritdoc}
-     */
     public function offReadable($stream): bool
     {
-        $fdKey = (int)$stream;
-        if (!isset($this->callbacks[$fdKey]['read'])) {
-            return false;
-        }
-        $this->callbacks[$fdKey]['read'] = null;
-        $this->updateWatcher($fdKey, $stream);
-        return true;
+        return $this->delStreamEvent($stream, 'read');
     }
 
-    /**
-     * {@inheritdoc}
-     */
     public function onWritable($stream, callable $func): void
     {
-        $fdKey = (int)$stream;
-        $this->callbacks[$fdKey]['write'] = $func;
-        $this->callbacks[$fdKey]['read'] ??= null;
-        $this->updateWatcher($fdKey, $stream);
+        $this->addStreamEvent($stream, 'write', $func);
     }
 
-    /**
-     * {@inheritdoc}
-     */
     public function offWritable($stream): bool
     {
-        $fdKey = (int)$stream;
-        if (!isset($this->callbacks[$fdKey]['write'])) {
-            return false;
-        }
-        $this->callbacks[$fdKey]['write'] = null;
-        $this->updateWatcher($fdKey, $stream);
-        return true;
+        return $this->delStreamEvent($stream, 'write');
     }
 
-    /**
-     * {@inheritdoc}
-     */
     public function onSignal(int $signal, callable $func): void
     {
-        if (DIRECTORY_SEPARATOR !== '/' || !extension_loaded('pcntl')) {
-            throw new \RuntimeException('Signals are only supported on POSIX systems with the pcntl extension');
+        if (DIRECTORY_SEPARATOR !== '/' || !function_exists('pcntl_signal')) {
+            return;
         }
-        $this->signals[$signal] = $func;
-        pcntl_signal($signal, fn () => $this->safeCall($func, [$signal]));
+        $this->signalEvents[$signal] = $func;
+        // 关闭 restart_syscalls，确保阻塞中的 Context::wait() 会被信号打断
+        pcntl_signal($signal, [$this, 'signalHandler'], false);
     }
 
-    /**
-     * {@inheritdoc}
-     */
     public function offSignal(int $signal): bool
     {
-        if (!isset($this->signals[$signal])) {
+        if (DIRECTORY_SEPARATOR !== '/' || !function_exists('pcntl_signal')) {
             return false;
         }
-        pcntl_signal($signal, SIG_DFL);
-        unset($this->signals[$signal]);
-        return true;
+        pcntl_signal($signal, SIG_IGN, false);
+        if (isset($this->signalEvents[$signal])) {
+            unset($this->signalEvents[$signal]);
+            return true;
+        }
+        return false;
     }
 
-    /**
-     * {@inheritdoc}
-     */
-    public function deleteAllTimer(): void
+    public function signalHandler(int $signal): void
     {
-        $this->timers = [];
-    }
-
-    /**
-     * {@inheritdoc}
-     */
-    public function run(): void
-    {
-        $this->running = true;
-        while ($this->running) {
-            if (!$this->watchers && !$this->timers) {
-                usleep(10000);
-                continue;
-            }
-
-            try {
-                $triggered = $this->wait($this->nextTimerTimeoutMicroseconds());
-            } catch (FailedPollWaitException) {
-                $triggered = [];
-            }
-
-            foreach ($triggered as $watcher) {
-                $this->dispatch($watcher);
-            }
-
-            $this->runTimers();
+        if (isset($this->signalEvents[$signal])) {
+            $this->safeCall($this->signalEvents[$signal], [$signal]);
         }
     }
 
-    /**
-     * {@inheritdoc}
-     */
-    public function stop(): void
+    public function deleteAllTimer(): void
     {
-        $this->running = false;
+        $this->scheduler = new SplPriorityQueue();
+        $this->eventTimer = [];
     }
 
-    /**
-     * {@inheritdoc}
-     */
     public function getTimerCount(): int
     {
-        return count($this->timers);
+        return count($this->eventTimer);
     }
 
-    /**
-     * {@inheritdoc}
-     */
     public function setErrorHandler(callable $errorHandler): void
     {
         $this->errorHandler = $errorHandler;
     }
 
-    /**
-     * Add, modify or remove the watcher of a stream to match its current callbacks.
-     *
-     * @param resource $stream
-     */
-    private function updateWatcher(int $fdKey, $stream): void
+    public function run(): void
     {
+        $this->running = true;
+        while ($this->running && $this->context !== null) {
+            if ($this->signalEvents !== [] && DIRECTORY_SEPARATOR === '/' && function_exists('pcntl_signal_dispatch')) {
+                pcntl_signal_dispatch();
+                // @mago-expect analysis:impossible-condition
+                if (!$this->running) {
+                    break;
+                }
+            }
+
+            $context = $this->context;
+            $timeoutNs = $this->computeTimeoutNanoseconds();
+            $watchers = [];
+
+            try {
+                $watchers = $context->wait($timeoutNs === null ? null : Duration::fromNanoseconds($timeoutNs));
+            } catch (FailedPollWaitException $e) {
+                if ($this->isInterrupted($e)) {
+                    // 被 POSIX 信号打断，回到循环顶部立即派发信号
+                    continue;
+                }
+                throw $e;
+            }
+
+            if (!$this->scheduler->isEmpty()) {
+                $this->tick();
+            }
+
+            if ($watchers !== [] && $this->running) {
+                $this->dispatch($watchers);
+            }
+        }
+    }
+
+    public function stop(): void
+    {
+        $this->running = false;
+        foreach (array_keys($this->events) as $key) {
+            $this->removeStreamWatcher($key);
+        }
+        $this->events = [];
+        $this->streamWatcherCount = 0;
+
+        foreach (array_keys($this->signalEvents) as $signal) {
+            $this->offSignal($signal);
+        }
+        $this->signalEvents = [];
+        $this->deleteAllTimer();
+        $this->context = null;
+    }
+
+    /**
+     * @param resource $stream
+     * @param 'read'|'write' $type
+     */
+    private function addStreamEvent($stream, string $type, callable $func): void
+    {
+        if (!is_resource($stream) || $this->context === null) {
+            return;
+        }
+        $key = (int) $stream;
+
+        // 防止底层 fd 编号被回收复用后残留旧 Watcher
+        if (isset($this->events[$key]) && $this->events[$key]['fd'] !== $stream) {
+            $this->removeStreamWatcher($key);
+            unset($this->events[$key]);
+        }
+
+        if (!isset($this->events[$key])) {
+            $this->events[$key] = [
+                'fd' => $stream,
+                'read' => null,
+                'write' => null,
+                'handle' => null,
+                'watcher' => null,
+            ];
+        }
+
+        $this->events[$key][$type] = $func;
+
+        try {
+            $this->syncStreamWatcher($key);
+        } catch (Throwable $e) {
+            $this->removeStreamWatcher($key);
+            unset($this->events[$key]);
+            $this->handleError($e);
+        }
+    }
+
+    /**
+     * @param resource $stream
+     * @param 'read'|'write' $type
+     */
+    private function delStreamEvent($stream, string $type): bool
+    {
+        if (!is_resource($stream)) {
+            return false;
+        }
+        $key = (int) $stream;
+        if (!isset($this->events[$key])) {
+            return false;
+        }
+        if ($this->events[$key]['fd'] !== $stream) {
+            $this->removeStreamWatcher($key);
+            unset($this->events[$key]);
+            return false;
+        }
+
+        $this->events[$key][$type] = null;
+
+        if ($this->events[$key]['read'] === null && $this->events[$key]['write'] === null) {
+            $this->removeStreamWatcher($key);
+            unset($this->events[$key]);
+            return true;
+        }
+
+        try {
+            $this->syncStreamWatcher($key);
+        } catch (Throwable $e) {
+            $this->removeStreamWatcher($key);
+            unset($this->events[$key]);
+            $this->handleError($e);
+            return false;
+        }
+        return true;
+    }
+
+    private function syncStreamWatcher(int $key): void
+    {
+        $context = $this->context;
+        if ($context === null) {
+            return;
+        }
+        $entry = $this->events[$key];
         $events = [];
-        if (isset($this->callbacks[$fdKey]['read'])) {
+        if ($entry['read'] !== null) {
             $events[] = Event::Read;
         }
-        if (isset($this->callbacks[$fdKey]['write'])) {
+        if ($entry['write'] !== null) {
             $events[] = Event::Write;
         }
 
-        if (!$events) {
-            unset($this->callbacks[$fdKey]);
-            if (isset($this->watchers[$fdKey])) {
-                $this->watchers[$fdKey]->remove();
-                unset($this->watchers[$fdKey]);
+        if ($events === []) {
+            $this->removeStreamWatcher($key);
+            return;
+        }
+
+        $watcher = $entry['watcher'];
+        if ($watcher !== null && $watcher->isActive()) {
+            if (!$this->sameEvents($watcher->getWatchedEvents(), $events)) {
+                $watcher->modifyEvents($events);
             }
             return;
         }
 
-        if (isset($this->watchers[$fdKey])) {
-            $this->watchers[$fdKey]->modifyEvents($events);
-            return;
-        }
+        $this->removeStreamWatcher($key);
+        $handle = new StreamPollHandle($entry['fd']);
+        $newWatcher = $context->add($handle, $events, $key);
 
-        $this->watchers[$fdKey] = $this->poll->add(new \StreamPollHandle($stream), $events);
+        $this->events[$key]['handle'] = $handle;
+        $this->events[$key]['watcher'] = $newWatcher;
+        $this->streamWatcherCount++;
     }
 
-    private function dispatch(Watcher $watcher): void
+    private function removeStreamWatcher(int $key): void
     {
-        $stream = $watcher->getHandle()->getStream();
-        if (!is_resource($stream)) {
+        if (!isset($this->events[$key])) {
             return;
         }
-        $fdKey = (int)$stream;
-        $callbacks = $this->callbacks[$fdKey] ?? [];
-
-        if ($watcher->hasTriggered(Event::HangUp) || $watcher->hasTriggered(Event::Error)) {
-            if (isset($callbacks['read'])) {
-                $this->safeCall($callbacks['read'], [$stream]);
+        $watcher = $this->events[$key]['watcher'];
+        if ($watcher !== null) {
+            try {
+                if ($watcher->isActive()) {
+                    $watcher->remove();
+                }
+            } catch (Throwable) {
+                // @mago-expect lint:no-empty-catch-clause Watcher 已失效时忽略
             }
-            return;
+            $this->events[$key]['watcher'] = null;
+            if ($this->streamWatcherCount > 0) {
+                $this->streamWatcherCount--;
+            }
         }
-
-        if ($watcher->hasTriggered(Event::Read) && isset($callbacks['read'])) {
-            $this->safeCall($callbacks['read'], [$stream]);
-        }
-
-        if ($watcher->hasTriggered(Event::Write) && isset($callbacks['write'])) {
-            $this->safeCall($callbacks['write'], [$stream]);
-        }
+        $this->events[$key]['handle'] = null;
     }
 
-    private function runTimers(): void
+    private function tick(): void
     {
-        $now = microtime(true);
-        foreach ($this->timers as $timerId => [$runAt, $interval, $func, $args]) {
-            if ($runAt > $now) {
+        /** @var list<array{0: int, 1: float}> $reinsert */
+        $reinsert = [];
+        while (!$this->scheduler->isEmpty()) {
+            [$timerId, $runTime] = $this->scheduler->top();
+            $timeNow = microtime(true);
+            if ($runTime > $timeNow) {
+                break;
+            }
+            $this->scheduler->extract();
+
+            if (!isset($this->eventTimer[$timerId])) {
                 continue;
             }
-            if ($interval > 0) {
-                $this->timers[$timerId][0] = $now + $interval;
-            } else {
-                unset($this->timers[$timerId]);
+
+            [$func, $args, $interval] = $this->eventTimer[$timerId];
+            if ($interval === null) {
+                unset($this->eventTimer[$timerId]);
             }
+            if ($interval !== null) {
+                $reinsert[] = [$timerId, $timeNow + $interval];
+            }
+
             $this->safeCall($func, $args);
+            if (!$this->running) {
+                return;
+            }
+        }
+
+        foreach ($reinsert as [$timerId, $nextRunTime]) {
+            if (!isset($this->eventTimer[$timerId])) {
+                continue;
+            }
+            $this->scheduler->insert([$timerId, $nextRunTime], -$nextRunTime);
         }
     }
 
-    /**
-     * Dispatch to the correct Context::wait() signature.
-     *
-     * Native PHP 8.6 and polyfill 1.x-dev take ?Time\Duration, while
-     * released polyfill 1.41 takes (?int $seconds, int $microseconds).
-     *
-     * @param int|null $timeoutMicroseconds null means block indefinitely
-     * @return array<Watcher>
-     */
-    private function wait(?int $timeoutMicroseconds): array
+    private function computeTimeoutNanoseconds(): ?int
     {
-        $this->waitUsesDuration ??= (string)(new \ReflectionMethod($this->poll, 'wait'))
-            ->getParameters()[0]->getType() === '?Time\Duration';
-
-        if ($this->waitUsesDuration) {
-            $timeout = $timeoutMicroseconds === null
-                ? null
-                : \Time\Duration::fromMicroseconds($timeoutMicroseconds);
-            return $this->poll->wait($timeout);
+        while (!$this->scheduler->isEmpty()) {
+            [$timerId, $runTime] = $this->scheduler->top();
+            if (!isset($this->eventTimer[$timerId])) {
+                $this->scheduler->extract();
+                continue;
+            }
+            $left = $runTime - microtime(true);
+            if ($left <= 0) {
+                return 0;
+            }
+            return (int) ceil($left * 1_000_000_000);
         }
 
-        return $this->poll->wait(
-            $timeoutMicroseconds === null ? null : intdiv($timeoutMicroseconds, 1_000_000),
-            $timeoutMicroseconds === null ? 0 : $timeoutMicroseconds % 1_000_000,
-        );
+        if ($this->streamWatcherCount === 0) {
+            // 无 fd 且无定时器时避免无限阻塞，确保信号能被及时处理
+            return 1_000_000_000;
+        }
+        return null;
     }
 
     /**
-     * @return int|null microseconds until the next timer fires, null means block indefinitely
+     * @param Watcher[] $watchers
      */
-    private function nextTimerTimeoutMicroseconds(): ?int
+    private function dispatch(array $watchers): void
     {
-        if (!$this->timers) {
-            return null;
+        foreach ($watchers as $watcher) {
+            // @mago-expect analysis:mixed-assignment
+            $key = $watcher->getData();
+            if (!is_int($key) || !isset($this->events[$key])) {
+                continue;
+            }
+
+            $readHangUp = $watcher->hasTriggered(Event::ReadHangUp);
+            $readable = $readHangUp || $watcher->hasTriggered(Event::Read);
+            $writable = $watcher->hasTriggered(Event::Write);
+            $failed = $readHangUp || $watcher->hasTriggered(Event::Error) || $watcher->hasTriggered(Event::HangUp);
+
+            // 对端关闭或异常时同样触发读回调，让 Workerman 读取 EOF 并关闭连接
+            if (($readable || $failed) && $this->events[$key]['read'] !== null) {
+                $this->safeCall($this->events[$key]['read'], [$this->events[$key]['fd']]);
+            }
+            // @mago-expect analysis:redundant-logical-operation
+            if (!isset($this->events[$key]) || !$this->running) {
+                continue;
+            }
+
+            if (($writable || $failed) && $this->events[$key]['write'] !== null) {
+                $this->safeCall($this->events[$key]['write'], [$this->events[$key]['fd']]);
+            }
         }
-        $now = microtime(true);
-        $next = min(array_column($this->timers, 0));
-        return max(0, (int)(($next - $now) * 1_000_000));
+    }
+
+    private function isInterrupted(FailedPollWaitException $e): bool
+    {
+        return $e->getCode() === FailedPollOperationException::ERROR_INTERRUPTED
+        || str_contains(strtolower($e->getMessage()), 'interrupted system call');
+    }
+
+    /**
+     * @param Event[] $watched
+     * @param Event[] $expected
+     */
+    private function sameEvents(array $watched, array $expected): bool
+    {
+        if (count($watched) !== count($expected)) {
+            return false;
+        }
+        foreach ($expected as $event) {
+            if (!in_array($event, $watched, true)) {
+                return false;
+            }
+        }
+        return true;
     }
 
     private function safeCall(callable $func, array $args = []): void
     {
         try {
             $func(...$args);
-        } catch (\Throwable $e) {
-            if ($this->errorHandler === null) {
-                echo $e;
-            } else {
-                ($this->errorHandler)($e);
-            }
+        } catch (Throwable $e) {
+            $this->handleError($e);
         }
+    }
+
+    private function handleError(Throwable $e): void
+    {
+        if ($this->errorHandler === null) {
+            Worker::safeEcho((string) $e . "\n");
+            return;
+        }
+
+        ($this->errorHandler)($e);
     }
 }

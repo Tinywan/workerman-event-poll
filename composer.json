@@ -1,6 +1,6 @@
 {
     "name": "tinywan/workerman-event-poll",
-    "description": "Workerman 5.x event loop driver based on the PHP 8.6 Io\\Poll API, with symfony polyfill support for PHP 8.1+",
+    "description": "Workerman 5.x event loop driver based on PHP 8.6 native Io\\Poll API",
     "type": "library",
     "license": "MIT",
     "keywords": [
@@ -18,12 +18,14 @@
         }
     ],
     "require": {
-        "php": ">=8.1",
-        "workerman/workerman": "^5.0",
-        "symfony/polyfill-io-poll": "^1.41"
+        "php": ">=8.6",
+        "workerman/workerman": "^5.0"
+    },
+    "require-dev": {
+        "carthage-software/mago": "^1.0",
+        "pestphp/pest": "^5.0"
     },
     "suggest": {
-        "symfony/polyfill-time": "Only needed if you pin symfony/polyfill-io-poll to 1.x-dev on PHP < 8.6 (provides Time\\Duration)",
         "ext-pcntl": "Required by Workerman on POSIX systems",
         "ext-posix": "Required by Workerman on POSIX systems"
     },
@@ -31,5 +33,24 @@
         "psr-4": {
             "Workerman\\Events\\": "src/"
         }
+    },
+    "config": {
+        "allow-plugins": {
+            "carthage-software/mago": true,
+            "pestphp/pest-plugin": true
+        }
+    },
+    "scripts": {
+        "format:check": "mago format --check",
+        "format": "mago format",
+        "lint": "mago lint",
+        "analyse": "mago analyze",
+        "test": "pest",
+        "check": [
+            "@format:check",
+            "@lint",
+            "@analyse",
+            "@test"
+        ]
     }
 }
