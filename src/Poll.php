@@ -234,8 +234,10 @@ final class Poll implements EventInterface
     public function run(): void
     {
         $this->running = true;
+        $canDispatchSignals = DIRECTORY_SEPARATOR === '/' && function_exists('pcntl_signal_dispatch');
+
         while ($this->running && $this->context !== null) {
-            if ($this->signalEvents !== [] && DIRECTORY_SEPARATOR === '/' && function_exists('pcntl_signal_dispatch')) {
+            if ($canDispatchSignals && $this->signalEvents !== []) {
                 pcntl_signal_dispatch();
                 // @mago-expect analysis:impossible-condition
                 if (!$this->running) {
@@ -244,11 +246,20 @@ final class Poll implements EventInterface
             }
 
             $context = $this->context;
-            $timeoutNs = $this->computeTimeoutNanoseconds();
-            $watchers = [];
+            $timeout = null;
+            if ($this->eventTimer !== []) {
+                $timeoutNs = $this->computeTimeoutNanoseconds();
+                if ($timeoutNs !== null) {
+                    $timeout = Duration::fromNanoseconds($timeoutNs);
+                }
+            }
+            if ($this->eventTimer === [] && $this->streamWatcherCount === 0) {
+                // 无 fd 且无定时器时避免无限阻塞，确保信号能被及时处理
+                $timeout = Duration::fromNanoseconds(1_000_000_000);
+            }
 
             try {
-                $watchers = $context->wait($timeoutNs === null ? null : Duration::fromNanoseconds($timeoutNs));
+                $watchers = $context->wait($timeout);
             } catch (FailedPollWaitException $e) {
                 if ($this->isInterrupted($e)) {
                     // 被 POSIX 信号打断，回到循环顶部立即派发信号
@@ -257,10 +268,11 @@ final class Poll implements EventInterface
                 throw $e;
             }
 
-            if (!$this->scheduler->isEmpty()) {
+            if ($this->eventTimer !== []) {
                 $this->tick();
             }
 
+            // @mago-expect analysis:redundant-logical-operation
             if ($watchers !== [] && $this->running) {
                 $this->dispatch($watchers);
             }
@@ -491,23 +503,64 @@ final class Poll implements EventInterface
                 continue;
             }
 
+            $entry = $this->events[$key];
+            $readCb = $entry['read'];
+            $writeCb = $entry['write'];
+            $fd = $entry['fd'];
+
+            // 最热路径：仅注册读回调，短路优先检测 Event::Read，1 次 hasTriggered() 即可完成
+            if ($readCb !== null && $writeCb === null) {
+                if (
+                    $watcher->hasTriggered(Event::Read)
+                    || $watcher->hasTriggered(Event::ReadHangUp)
+                    || $watcher->hasTriggered(Event::Error)
+                    || $watcher->hasTriggered(Event::HangUp)
+                ) {
+                    $this->callStreamCallback($readCb, $fd);
+                }
+                continue;
+            }
+
+            // 次热路径：仅注册写回调
+            if ($readCb === null && $writeCb !== null) {
+                if (
+                    $watcher->hasTriggered(Event::Write)
+                    || $watcher->hasTriggered(Event::Error)
+                    || $watcher->hasTriggered(Event::HangUp)
+                    || $watcher->hasTriggered(Event::ReadHangUp)
+                ) {
+                    $this->callStreamCallback($writeCb, $fd);
+                }
+                continue;
+            }
+
+            // 同时注册读写回调
             $readHangUp = $watcher->hasTriggered(Event::ReadHangUp);
-            $readable = $readHangUp || $watcher->hasTriggered(Event::Read);
-            $writable = $watcher->hasTriggered(Event::Write);
             $failed = $readHangUp || $watcher->hasTriggered(Event::Error) || $watcher->hasTriggered(Event::HangUp);
 
-            // 对端关闭或异常时同样触发读回调，让 Workerman 读取 EOF 并关闭连接
-            if (($readable || $failed) && $this->events[$key]['read'] !== null) {
-                $this->safeCall($this->events[$key]['read'], [$this->events[$key]['fd']]);
+            if ($readCb !== null && ($failed || $watcher->hasTriggered(Event::Read))) {
+                $this->callStreamCallback($readCb, $fd);
             }
             // @mago-expect analysis:redundant-logical-operation
             if (!isset($this->events[$key]) || !$this->running) {
                 continue;
             }
 
-            if (($writable || $failed) && $this->events[$key]['write'] !== null) {
-                $this->safeCall($this->events[$key]['write'], [$this->events[$key]['fd']]);
+            if ($writeCb !== null && ($failed || $watcher->hasTriggered(Event::Write))) {
+                $this->callStreamCallback($writeCb, $fd);
             }
+        }
+    }
+
+    /**
+     * @param resource $stream
+     */
+    private function callStreamCallback(callable $func, $stream): void
+    {
+        try {
+            $func($stream);
+        } catch (Throwable $e) {
+            $this->handleError($e);
         }
     }
 
