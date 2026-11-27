@@ -11,7 +11,7 @@ declare(strict_types=1);
  *   php examples/http.php status|stop|restart
  *
  * Test:
- *   curl http://127.0.0.1:2345/
+ *   curl http://127.0.0.1:8601/
  */
 
 require_once __DIR__ . '/../vendor/autoload.php';
@@ -22,7 +22,7 @@ use Workerman\Protocols\Http\Request;
 use Workerman\Protocols\Http\Response;
 use Workerman\Worker;
 
-$worker = new Worker('http://0.0.0.0:2345');
+$worker = new Worker('http://0.0.0.0:8601');
 $worker->name = 'poll-http';
 $worker->count = 4;
 $worker->eventLoop = Poll::class;

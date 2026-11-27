@@ -11,7 +11,7 @@ declare(strict_types=1);
  *   php examples/websocket.php status|stop|restart
  *
  * Test (browser console):
- *   const ws = new WebSocket('ws://127.0.0.1:2000');
+ *   const ws = new WebSocket('ws://127.0.0.1:8602');
  *   ws.onmessage = (e) => console.log(e.data);
  *   ws.onopen = () => ws.send('world');
  */
@@ -22,7 +22,7 @@ use Workerman\Connection\TcpConnection;
 use Workerman\Events\Poll;
 use Workerman\Worker;
 
-$worker = new Worker('websocket://0.0.0.0:2000');
+$worker = new Worker('websocket://0.0.0.0:8602');
 $worker->name = 'poll-websocket';
 $worker->count = 4;
 $worker->eventLoop = Poll::class;

@@ -42,7 +42,7 @@ Worker::$eventLoopClass = Poll::class;
 use Workerman\Events\Poll;
 use Workerman\Worker;
 
-$worker = new Worker('http://0.0.0.0:2345');
+$worker = new Worker('http://0.0.0.0:8601');
 
 if (Poll::isSupported()) {
     $worker->eventLoop = Poll::class;
@@ -74,7 +74,7 @@ use Workerman\Protocols\Http\Request;
 use Workerman\Protocols\Http\Response;
 use Workerman\Worker;
 
-$worker = new Worker('http://0.0.0.0:2345');
+$worker = new Worker('http://0.0.0.0:8601');
 $worker->name = 'poll-http';
 $worker->count = 4;
 $worker->eventLoop = Poll::class;
@@ -99,7 +99,7 @@ Worker::runAll();
 
 ```bash
 php examples/http.php start
-curl "http://127.0.0.1:2345/ping?name=workerman"
+curl "http://127.0.0.1:8601/ping?name=workerman"
 ```
 
 ### 2. WebSocket 服务（[`examples/websocket.php`](examples/websocket.php)）
@@ -115,7 +115,7 @@ use Workerman\Connection\TcpConnection;
 use Workerman\Events\Poll;
 use Workerman\Worker;
 
-$worker = new Worker('websocket://0.0.0.0:2000');
+$worker = new Worker('websocket://0.0.0.0:8602');
 $worker->name = 'poll-websocket';
 $worker->count = 4;
 $worker->eventLoop = Poll::class;
@@ -138,7 +138,7 @@ php examples/websocket.php start
 ```
 
 ```js
-const ws = new WebSocket('ws://127.0.0.1:2000');
+const ws = new WebSocket('ws://127.0.0.1:8602');
 ws.onmessage = (e) => console.log('recv:', e.data);
 ws.onopen = () => ws.send('world');
 ```
@@ -156,7 +156,7 @@ use Workerman\Connection\TcpConnection;
 use Workerman\Events\Poll;
 use Workerman\Worker;
 
-$worker = new Worker('tcp://0.0.0.0:2347');
+$worker = new Worker('tcp://0.0.0.0:8603');
 $worker->name = 'poll-tcp';
 $worker->count = 4;
 $worker->eventLoop = Poll::class;
@@ -172,7 +172,7 @@ Worker::runAll();
 
 ```bash
 php examples/tcp.php start
-telnet 127.0.0.1 2347
+telnet 127.0.0.1 8603
 ```
 
 ## Comparison with Built-in Drivers

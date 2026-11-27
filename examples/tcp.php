@@ -11,7 +11,7 @@ declare(strict_types=1);
  *   php examples/tcp.php status|stop|restart
  *
  * Test:
- *   telnet 127.0.0.1 2347
+ *   telnet 127.0.0.1 8603
  */
 
 require_once __DIR__ . '/../vendor/autoload.php';
@@ -20,7 +20,7 @@ use Workerman\Connection\TcpConnection;
 use Workerman\Events\Poll;
 use Workerman\Worker;
 
-$worker = new Worker('tcp://0.0.0.0:2347');
+$worker = new Worker('tcp://0.0.0.0:8603');
 $worker->name = 'poll-tcp';
 $worker->count = 4;
 $worker->eventLoop = Poll::class;
